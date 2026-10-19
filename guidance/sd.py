@@ -120,7 +120,7 @@ class StableDiffusion(nn.Module):
         t = torch.randint(
             self.min_step, #可抽取的最小 timestep
             self.max_step + 1,
-            (B),
+            (B,),
             device=latents.device,
             dtype=torch.long
         )
