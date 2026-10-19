@@ -115,7 +115,60 @@ class StableDiffusion(nn.Module):
             loss: Scalar SDS loss
         """
         # TODO: Implement SDS loss
-        raise NotImplementedError("TODO: Implement SDS loss")
+        B = latents.shape[0]  # 取得 batch size，也就是一次處理幾筆資料
+        # 隨機選擇 diffusion timestep
+        t = torch.randint(
+            self.min_step, #可抽取的最小 timestep
+            self.max_step + 1,
+            (B),
+            device=latents.device,
+            dtype=torch.long
+        )
+        
+        # 產生 Gaussian noise
+        # 產生與 latents 形狀相同的隨機數值
+        noise = torch.randn_like(latents)
+        
+        # 取得 alpha_t
+        alpha = self.alphas[t].to(
+            device=latents.device,
+            dtype=latents.dtype
+        )
+        alpha = alpha.view(B, 1, 1, 1)
+        
+        # 使用 scheduler 內建的函式，將 noise 加到 latents
+        # 根據 scheduler 內部的累積 alpha 值，計算對應 timestep 的加噪結果
+        latents_noisy = self.scheduler.add_noise(
+            latents,
+            noise,
+            t
+        )
+        
+        # 使用 classifier-free guidance 預測 noise
+        noise_pred = self.get_noise_preds(
+            latents_noisy,
+            t,
+            text_embeddings,
+            guidance_scale=guidance_scale
+        )
+        
+        # 計算 SDS gradient
+        # (1.0 - alpha)是與 timestep 有關的權重 會影響模型預測誤差對梯度的貢獻
+        grad = (1.0 - alpha) * (noise_pred - noise)
+        grad = torch.nan_to_num(grad)
+        
+        # 將 gradient 轉換成 surrogate MSE loss
+        # 為了讓 loss 的反向傳播產生希望的梯度方向而建立的
+        target = (latents - grad).detach()
+        
+        loss = 0.5 * F.mse_loss(
+            latents,
+            target,
+            reduction="sum"
+        ) / B
+
+        return loss
+        #raise NotImplementedError("TODO: Implement SDS loss")
 
     def get_vsd_loss(self, latents, text_embeddings, guidance_scale=7.5, lora_loss_weight=1.0):
         """
