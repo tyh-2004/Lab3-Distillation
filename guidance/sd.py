@@ -443,7 +443,7 @@ class StableDiffusion(nn.Module):
             dtype=torch.float32,
         ).round().long()
         # 目前的 latent 一開始就是乾淨 latent x_0
-        latents_noisy = latents
+        latents_noisy = latents.clone()
         # 直接使用 scheduler 中的 cumulative alpha：
         #     alpha_bar_t = self.scheduler.alphas_cumprod[t]
         # 這裡不能使用單步 alpha_t。
@@ -514,11 +514,9 @@ class StableDiffusion(nn.Module):
             #           + sqrt(1 - alpha_bar_t) * noise
             #
             # 移項後可以估計乾淨 latent：
-            #
             #     x_0_pred =
             #         (x_t - sqrt(1-alpha_bar_t)*noise_pred)
             #         / sqrt(alpha_bar_t)
-            #
             x0_pred = (
                 latents_noisy
                 - torch.sqrt(1.0 - alpha_bar_current) * noise_pred
@@ -580,14 +578,38 @@ class StableDiffusion(nn.Module):
         B = latents.shape[0]
 
         # TODO: Compute the annealed timestep for the current iteration
-        t = None
+        # timestep annealing
+        # 隨著訓練進行 timestep 會從 max_step 線性下降到 min_step
+        progress = current_iter / max(total_iters - 1, 1)
+        progress = min(max(progress, 0.0), 1.0)
+    
+        t_value = round(
+            self.max_step
+            - progress * (self.max_step - self.min_step)
+        )
+        # 將 timestep 限制在允許的範圍內
+        t_value = max(self.min_step, min(t_value, self.max_step))
+        # UNet predict timestep's shape is (B,)
+        t = torch.full(
+            (B,),
+            t_value,
+            device=latents.device,
+            dtype=torch.long,
+        )
+
+        # 判斷是否需要更新暫存的 target
+        # 每隔 update_interval 次更新一次 target。
+        # 第一次執行時，因為還沒有 sdi_target，所以一定要計算。
+        update_interval = max(1, int(update_interval))
 
         # Check if we need to update target
         should_update = (current_iter % update_interval == 0) or not hasattr(self, 'sdi_target')
 
         if should_update:
+            # target 的計算不需要保留反向傳播的計算圖 可以節省 GPU 記憶體
             with torch.no_grad():
                 # Perform DDIM inversion: x0 -> x_t
+                # whole batches should inversion to same aim timestep
                 latents_noisy = self.invert_noise(
                     latents, t, text_embeddings,
                     guidance_scale=inversion_guidance_scale,
@@ -596,16 +618,39 @@ class StableDiffusion(nn.Module):
                 )
 
                 # TODO: Predict noise from the inverted noisy latents
-                noise_pred = None
-
+                noise_pred = self.get_noise_preds(
+                    latents_noisy,
+                    t,
+                    text_embeddings,
+                    guidance_scale=guidance_scale,
+                )
+                # 從 noisy latent 與預測的 noise，估計乾淨 latent
+                # alpha_bar is cumulative alpha instead of single step alpha
+                alpha_bar = self.scheduler.alphas_cumprod.to(
+                    device=latents.device,
+                    dtype=latents.dtype,
+                )[t_value]
+    
+                # 將 alpha_bar 調整成可以與 (B, 4, H, W) 相乘的形狀
+                alpha_bar = alpha_bar.clamp(min=1e-5, max=1.0)
+                alpha_bar = alpha_bar.view(1, 1, 1, 1)
                 # TODO: Denoise to get the target x0 from the predicted noise
-                target = None
+                target = (
+                    latents_noisy
+                    - torch.sqrt(1.0 - alpha_bar) * noise_pred
+                ) / torch.sqrt(alpha_bar)
 
                 # Cache the target
                 self.sdi_target = target.detach()
 
         # TODO: Compute the MSE loss between current latents and the cached target
-        loss = None
+        # 讓目前的 latents 靠近 inversion 後得到的 denoised target
+        # target 已經 detach，因此不會透過 target 回傳梯度
+        loss = 0.5 * F.mse_loss(
+            latents.float(),
+            self.sdi_target.float(),
+            reduction="sum",
+        ) / B
 
         return loss
         
